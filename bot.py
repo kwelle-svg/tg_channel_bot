@@ -1,9 +1,13 @@
-#!venv/bin/python
+import json
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from pytz import timezone
+
 from aiogram.fsm.storage.base import StorageKey
 
 import logging
 import asyncio
 import datetime
+import aiosqlite
 from random import randint
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.types import InputMediaPhoto, Message, TelegramObject
@@ -13,32 +17,34 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.media_group import MediaGroupBuilder
-from aiogram.utils.keyboard import InlineKeyboardBuilder
 import re
 
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters.callback_data import CallbackData
 
 from aiogram import BaseMiddleware
-from typing import Callable, Any, Awaitable, Union, List, Callable, Dict
+from typing import Callable, Any, Awaitable, Union, List, Callable, Dict, Optional
 
 from hashtag import find_words
 from config import BOT_TOKEN, chatid, tgChanel_id
 from states import Registration, Hashtag, Time
+from database import init_db, DB_NAME
+from keyboards import TakeCallback, get_send_or_not_keyboard, get_confirm_keyboard, back_keyboard, new_hashtag_keyboard
 
-# Объект бота
+
+moscow_tz = timezone('Europe/Moscow')
+scheduler = AsyncIOScheduler(timezone=moscow_tz)
+
 bot = Bot(token=BOT_TOKEN,
           default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-# Диспетчер для бота
+
 router = Router()
 dp = Dispatcher()
-dp.include_router(router)
-# Включаем логирование, чтобы не пропустить важные сообщения
-logging.basicConfig(level=logging.INFO)
-router = Router()
 
+logging.basicConfig(level=logging.INFO)
 
 def get_admin_state(bot: Bot, dp: Dispatcher):
     return FSMContext(
@@ -47,9 +53,6 @@ def get_admin_state(bot: Bot, dp: Dispatcher):
     )
 
 
-# Добавить возможность просто боту выкладывать тейк в Хейт Хойо кф (он спрашивает выкладывать или нет)
-# Также бот будет спрашивать верные ли хэштеги стоят
-# Хэндлер на команду /start
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.reply("Напишите пожалуйста ваш тейк (НЕ НУЖНО добавлять оформление). Если обнаружите ошибку - напишите cюда (ссылку добав)\n\nДля создания был использован бот (будущий бот)")
@@ -59,39 +62,107 @@ manecen = '#тейк #другое | <a href="t.me/@HateHoyoCfBot">бот для
 
 
 
-# Тест хэштегов
+class AlbumMiddleware(BaseMiddleware):
+    def __init__(self, latency: float = 0.2):
+        self.latency = latency
+        self.album_data: Dict[str, List[Message]] = {}
 
-# Определяем состояния
-class Form(StatesGroup):
-    waiting_for_hashtags = State() # Состояние ожидания текста хэштегов
+    async def __call__(self, handler, event: Message, data: Dict[str, Any]) -> Any:
+        if not event.media_group_id:
+            return await handler(event, data)
+        try:
+            if event.media_group_id not in self.album_data:
+                self.album_data[event.media_group_id] = [event]
+                await asyncio.sleep(self.latency)
+                data["album"] = self.album_data.pop(event.media_group_id)
+                return await handler(event, data)
+            else:
+                self.album_data[event.media_group_id].append(event)
+        except Exception:
+            return await handler(event, data)
 
-
-def get_send_or_not_keyboard():
-    return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="Отправить", callback_data="send_or_plan_take")],
-        [types.InlineKeyboardButton(text="Редактировать хэштеги",
-                                    callback_data="change_hashtag")],
-        [types.InlineKeyboardButton(text="Отклонить", callback_data="del_or_not_take")]
-    ])
-
-@dp.message(Command("random"))
-async def cmd_random(message: types.Message):
-    await message.answer("Отправлять тейк?",
-                         reply_markup=get_send_or_not_keyboard())
+router.message.middleware(AlbumMiddleware())
 
 
 
 # ============== HASHTAGS ==============
-@dp.callback_query(F.data == "change_hashtag")
-async def cmd_reg(callback: types.CallbackQuery, state: FSMContext):
-    # !!! ПРОВЕРИТЬ ЧАТ АЙДИ
-    msg_to_del = await bot.send_message(chat_id=chatid,
-                           text="Напишите новый(е) хештег(и) (обязательно с #)")
-    
-    # if() # ПРОВЕРКУ ХЭШТЕГ ЕСТЬ ИЛИ НЕТ ДОБАВИТЬ
-    await state.set_state(Hashtag.new_hashtag)
-    await state.update_data(msg_to_del=msg_to_del.message_id)
-    await callback.answer()
+
+@router.callback_query(TakeCallback.filter(F.action == "add_tag"))
+async def add_hashtag_from_kb(callback: types.CallbackQuery, callback_data: TakeCallback):
+    take_id = callback_data.take_id
+    new_tag = callback_data.hashtag
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT main_msg_id, original_text, finish_text, media_type FROM takes WHERE id = ?", (take_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row: return
+            
+            main_msg_id, orig_text, current_finish, media_type = row
+            
+            if new_tag in current_finish:
+                await callback.answer(f"Тэг {new_tag} уже есть!")
+                return
+
+            parts = current_finish.split('|')
+            if len(parts) > 1:
+                updated_text = f"{parts[0].strip()} {new_tag} | {parts[1].strip()}"
+            else:
+                updated_text = f"{current_finish} {new_tag}"
+
+            await db.execute("UPDATE takes SET finish_text = ? WHERE id = ?", (updated_text, take_id))
+            await db.commit()
+
+    try:
+        if media_type != "text":
+            await bot.edit_message_caption(
+                chat_id=chatid, 
+                message_id=main_msg_id, 
+                caption=updated_text
+            )
+        else:
+            await bot.edit_message_text(
+                chat_id=chatid, 
+                message_id=main_msg_id, 
+                text=updated_text
+            )
+        await callback.answer(f"Добавлен {new_tag}")
+    except Exception as e:
+        logging.error(f"Error editing preview: {e}")
+        await callback.answer("Ошибка обновления превью")
+
+@router.callback_query(TakeCallback.filter(F.action == "reset_tags"))
+async def reset_hashtags(callback: types.CallbackQuery, callback_data: TakeCallback):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT main_msg_id, original_text, media_type FROM takes WHERE id = ?", (callback_data.take_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                main_msg_id, orig_text, media_type = row
+                reset_text = f'{orig_text}\n\n#тейк | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+                await db.execute("UPDATE takes SET finish_text = ? WHERE id = ?", (reset_text, callback_data.take_id))
+                await db.commit()
+                
+                try:
+                    if media_type != "text":
+                        await bot.edit_message_caption(chat_id=chatid, message_id=main_msg_id, caption=reset_text)
+                    else:
+                        await bot.edit_message_text(chat_id=chatid, message_id=main_msg_id, text=reset_text)
+                except Exception: pass
+    await callback.answer("Хэштеги сброшены")
+
+@dp.callback_query(TakeCallback.filter(F.action == "new_hashtag"))
+async def adding_new_hashtags(callback: types.CallbackQuery, callback_data: TakeCallback):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT finish_text, media_type, file_id FROM takes WHERE id = ?", (callback_data.take_id,)) as cursor:
+            row = await cursor.fetchone()
+            
+            hashtag = "#генш" if callback_data.hashtag=="gensh" else "#другое" 
+            if row:
+                text, media_type, file_id = row
+                await callback.message.edit_text("Тейк отправлен✅")
+                await db.execute(f"UPDATE takes SET hashtag = 'sent' WHERE id = ?", (callback_data.take_id,))
+                await db.commit()
+            else:
+                await callback.answer("Ошибка: тейк не найден в базе.")
 
 @dp.message(Hashtag.new_hashtag)
 async def proccess_hashtag(message: types.Message, state: FSMContext):
@@ -135,163 +206,116 @@ async def proccess_hashtag(message: types.Message, state: FSMContext):
     
     await state.update_data(original_text=original_text,
                             finish_text=updated_text)
-    
-    # Сбрасываем состояние
-    # await state.clear()
-
 
 
 # ===========ФОТОГРАФИИ===========
 
-
-
-class AlbumMiddleware(BaseMiddleware):
-    def __init__(self, latency: float = 0.2):
-        self.latency = latency
-        self.album_data: Dict[str, List[Message]] = {}
-
-    async def __call__(self, handler, event: Message, data: Dict[str, Any]) -> Any:
-        # If the message is not part of an album, just pass it through
-        if not event.media_group_id:
-            return await handler(event, data)
-
-        try:
-            # If this is the first message of an album, create a list
-            if event.media_group_id not in self.album_data:
-                self.album_data[event.media_group_id] = [event]
-                # Wait for other messages to arrive
-                await asyncio.sleep(self.latency)
-                
-                # After waiting, put the collected messages into 'album' data
-                data["album"] = self.album_data.pop(event.media_group_id)
-                return await handler(event, data)
-            else:
-                # If the album list already exists, just add this message to it
-                self.album_data[event.media_group_id].append(event)
-        except Exception:
-            return await handler(event, data)
-
-
-dp.message.middleware(AlbumMiddleware())
-
-@dp.message(F.media_group_id)
-async def handle_albums(message: Message, album: List[Message], state: FSMContext):
-    adm_state = get_admin_state(bot, dp)
-    
+@router.message(F.media_group_id)
+async def handle_albums(message: Message, album: List[Message]):
     caption = album[0].caption or ""
-    formatted_caption = f'{caption + "\n\n" if caption else ""}#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+    formatted = f'{caption}\n\n#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
     
-    # Save file IDs for the channel later
     media_files = []
-    builder = MediaGroupBuilder(caption=formatted_caption)
-    
+    builder = MediaGroupBuilder(caption=formatted)
     for msg in album:
         if msg.photo:
-            file_id = msg.photo[-1].file_id
-            media_files.append({'type': 'photo', 'file_id': file_id})
-            builder.add_photo(media=file_id)
+            media_files.append({'type': 'photo', 'file_id': msg.photo[-1].file_id})
+            builder.add_photo(media=msg.photo[-1].file_id)
         elif msg.video:
-            file_id = msg.video.file_id
-            media_files.append({'type': 'video', 'file_id': file_id})
-            builder.add_video(media=file_id)
+            media_files.append({'type': 'video', 'file_id': msg.video.file_id})
+            builder.add_video(media=msg.video.file_id)
 
-    # Send to ADMIN for preview
     sent = await bot.send_media_group(chat_id=chatid, media=builder.build())
-    await bot.send_message(chat_id=chatid, text="Отправлять тейк?", reply_markup=get_send_or_not_keyboard())
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "INSERT INTO takes (user_id, main_msg_id, original_text, finish_text, media_type, file_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (message.from_user.id, sent[0].message_id, caption, formatted, "album", json.dumps(media_files))
+        )
+        t_id = cursor.lastrowid
+        await db.commit()
+    await bot.send_message(chat_id=chatid, text=f"Тейк #{t_id}. Отправить?", reply_markup=get_send_or_not_keyboard(t_id))
 
-    await adm_state.update_data(
-        main_msg_id=sent[0].message_id,
-        finish_text=formatted_caption,
-        original_text=caption,
-        media_type="album",
-        media_files=media_files
-    )
-
-@dp.message(F.photo)
-async def handle_single_photo(message: Message):
-    adm_state = get_admin_state(bot, dp)
-    
-    file_id = message.photo[-1].file_id
+@router.message(F.photo)
+async def handle_photo(message: Message):
+    f_id = message.photo[-1].file_id
     caption = message.caption or ""
-    formatted_caption = f'{caption + "\n\n" if caption else ""}#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+    formatted = f'{caption}\n\n#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
     
-    sent = await bot.send_photo(chat_id=chatid, photo=file_id, caption=formatted_caption)
-    await bot.send_message(chat_id=chatid, text="Отправлять тейк?", reply_markup=get_send_or_not_keyboard())
-    
-    await adm_state.update_data(
-        main_msg_id=sent.message_id,
-        original_text=caption,
-        finish_text=formatted_caption,
-        media_type="photo",
-        file_id=file_id
-    )
+    sent = await bot.send_photo(chat_id=chatid, photo=f_id, caption=formatted)
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute("INSERT INTO takes (user_id, main_msg_id, original_text, finish_text, media_type, file_id) VALUES (?, ?, ?, ?, ?, ?)",
+                                 (message.from_user.id, sent.message_id, caption, formatted, "photo", f_id))
+        t_id = cursor.lastrowid
+        await db.commit()
+    await bot.send_message(chat_id=chatid, text=f"Тейк #{t_id}. Отправить?", reply_markup=get_send_or_not_keyboard(t_id))
 
 @dp.message(F.video)
-async def echo_video_messages(message: types.Message, state: FSMContext):
-    adm_state = get_admin_state(bot, dp)
-    
+async def echo_video_messages(message: Message):
     file_id = message.video.file_id
     caption = message.caption or ""
     formatted_caption = f'{caption + "\n\n" if caption else ""}#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
     
     sent = await bot.send_video(chat_id=chatid, video=file_id, caption=formatted_caption)
-    await bot.send_message(chat_id=chatid, text="Отправлять тейк?", reply_markup=get_send_or_not_keyboard())
     
-    await adm_state.update_data(
-        main_msg_id=sent.message_id,
-        finish_text=formatted_caption,
-        original_text=caption,
-        media_type="video",
-        file_id=file_id
-    )
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "INSERT INTO takes (user_id, main_msg_id, original_text, finish_text, media_type, file_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (message.from_user.id, sent.message_id, caption, formatted_caption, "video", file_id)
+        )
+        take_id = cursor.lastrowid
+        await db.commit()
+
+    await bot.send_message(chat_id=chatid, text=f"Тейк #{take_id}. Отправлять?", reply_markup=get_send_or_not_keyboard(take_id))
 
 # ================= Клавиатура ======================
-# Отправить или запланировать
-@dp.callback_query(F.data == "send_or_plan_take")
-async def send_or_plan_take(callback: types.CallbackQuery):
-    new_keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="Сейчас", callback_data="send_take")],
-        [types.InlineKeyboardButton(text="Запланировать", callback_data="taking_time_from_user")],
-        [types.InlineKeyboardButton(text="Я передумала", callback_data="go_back")] # Добавляем кнопку назад
-    ])
-    await callback.message.edit_text("Когда отправить тейк?", reply_markup=new_keyboard)
-    await callback.answer()
 
-async def sending_take(state: FSMContext):
-    data = await state.get_data()
-    text = data.get("finish_text")
-    media_type = data.get("media_type") # 'photo', 'video', 'album', or None (text)
-    
-    if media_type == "photo":
-        await bot.send_photo(chat_id=tgChanel_id, photo=data.get("file_id"), caption=text)
-    
-    elif media_type == "video":
-        await bot.send_video(chat_id=tgChanel_id, video=data.get("file_id"), caption=text)
-    
-    elif media_type == "album":
-        # Reconstruct the album from saved file_ids
-        media_list = data.get("media_files")
-        builder = MediaGroupBuilder(caption=text)
-        for item in media_list:
-            if item['type'] == 'photo':
-                builder.add_photo(media=item['file_id'])
+async def sending_take(take_id: int, plan_msg_id: int = None):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT finish_text, media_type, file_id, main_msg_id FROM takes WHERE id = ?", (take_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                logging.error(f"Тейк {take_id} не найден!")
+                return
+            text, media_type, file_id, main_msg_id = row
+
+        try:
+            if media_type == "photo":
+                await bot.send_photo(chat_id=tgChanel_id, photo=file_id, caption=text)
+            elif media_type == "video":
+                await bot.send_video(chat_id=tgChanel_id, video=file_id, caption=text)
+            elif media_type == "album":
+                media_list = json.loads(file_id)
+                builder = MediaGroupBuilder(caption=text)
+                for item in media_list:
+                    if item['type'] == 'photo':
+                        builder.add_photo(media=item['file_id'])
+                    else:
+                        builder.add_video(media=item['file_id'])
+                await bot.send_media_group(chat_id=tgChanel_id, media=builder.build())
             else:
-                builder.add_video(media=item['file_id'])
-        await bot.send_media_group(chat_id=tgChanel_id, media=builder.build())
-    
-    else:
-        # Just text
-        await bot.send_message(chat_id=tgChanel_id, text=text)
-    
-    await state.clear()
+                await bot.send_message(chat_id=tgChanel_id, text=text)
+            
+            try:
+                await bot.edit_message_text(
+                    chat_id=chatid,
+                    message_id=main_msg_id + 1, 
+                    text=f"✅ Тейк #{take_id} успешно отправлен",
+                    reply_markup=None
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось обновить кнопки для тейка {take_id}: {e}")
 
-# Отправка тейка
-@dp.callback_query(F.data == "send_take")
-async def send_take(callback: types.CallbackQuery, state: FSMContext):
-    await sending_take(state=state)
-    await callback.message.delete()
-    await callback.message.answer("Тейк отправлен✅")
+            if plan_msg_id:
+                try:
+                    await bot.delete_message(chat_id=chatid, message_id=plan_msg_id)
+                except: pass
 
+            await db.execute("DELETE FROM takes WHERE id = ?", (take_id,))
+            await db.commit()
+            logging.info(f"Тейк {take_id} отправлен и удален.")
+        except Exception as e:
+            logging.error(f"Ошибка отправки: {e}")
+            
 
 async def how_much_time(current_time, when_send) -> int:
     hours_of_current_time = int(current_time[:2])*60*60
@@ -299,7 +323,7 @@ async def how_much_time(current_time, when_send) -> int:
     seconds_of_current_time = int(current_time[6:])
     int_current_time = hours_of_current_time+minutes_of_current_time+seconds_of_current_time
     print(when_send[:2], when_send[3:5])
-    if(when_send[-2:] == "+1"): # Сделать ограничение в 86400 сек (24 часа)
+    if(when_send[-2:] == "+1"):
         hours_of_when_send = (24+int(when_send[:2]))*60*60
     else:
         hours_of_when_send = int(when_send[:2])*60*60
@@ -309,110 +333,138 @@ async def how_much_time(current_time, when_send) -> int:
     return int_when_send-int_current_time
 
 
-@dp.callback_query(F.data == "taking_time_from_user")
-async def taking_time(callback: types.CallbackQuery, state: FSMContext):
-    # Можно в выводимое сообщение добавить настоящее нынешнее время
-    current_time = str(datetime.datetime.now())[11:16]
-    current_date = str(datetime.datetime.now())[:10]
-    print(str(datetime.datetime.now())[:11])
-    msg_to_edit = await bot.send_message(chat_id=chatid,
-    text=f"Напишите время\n(в формате {current_time} или {current_time} +1 для отправки на следующий день)")
+@router.message(Time.send_time)
+async def planning_take(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    take_id = data.get("take_id")
+    msg_to_edit_id = data.get("msg_to_edit_id")
+    
+    try:
+        time_parts = datetime.datetime.strptime(message.text.strip(), "%H:%M")
+        now_msk = datetime.datetime.now(moscow_tz)
+        
+        run_date = now_msk.replace(
+            hour=time_parts.hour, 
+            minute=time_parts.minute, 
+            second=0, microsecond=0
+        )
 
-    # if # ПРОВЕРКУ ФОРМАТА ВРЕМЕНИ ДОБАВИТЬ
+        if run_date < now_msk:
+            run_date += datetime.timedelta(days=1)
+
+        scheduler.add_job(
+            sending_take,
+            trigger='date',
+            run_date=run_date,
+            args=[take_id],
+            id=f"take_{take_id}"
+        )
+
+        await bot.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=msg_to_edit_id,
+            text=f"✅ Тейк #{take_id} запланирован!\n⏰ Отправка: {run_date.strftime('%d.%m %H:%M')} (МСК)"
+        )
+
+        scheduler.add_job(
+            sending_take,
+            trigger='date',
+            run_date=run_date,
+            args=[take_id, msg_to_edit_id],
+            id=f"take_{take_id}",
+            replace_existing=True
+        )
+
+        await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Неверный формат. Нужно ЧЧ:ММ (например, 15:30)")
+
+
+
+
+
+@router.callback_query(TakeCallback.filter(F.action == "plan"))
+async def plan_callback(callback: types.CallbackQuery, callback_data: TakeCallback, state: FSMContext):
+    now_msk = datetime.datetime.now(moscow_tz)
+    msg = await callback.message.answer(
+        f"Введите время для тейка #{callback_data.take_id} (ЧЧ:ММ).\n"
+        f"Сейчас в Москве: {now_msk.strftime('%H:%M')}"
+    )
     await state.set_state(Time.send_time)
-    await state.update_data(msg_to_edit=msg_to_edit)
+    await state.update_data(msg_to_edit_id=msg.message_id, take_id=callback_data.take_id)
     await callback.answer()
 
-# Когда отправляем тейк
-@dp.message(Time.send_time)
-async def planning_take(message: types.Message, state: FSMContext):
-    # if message.text== # Проверку короче
-    await state.update_data(send_time=message.text)
-    data = await state.get_data()
+@router.callback_query(TakeCallback.filter(F.action == "send_now"))
+async def process_send_now(callback: types.CallbackQuery, callback_data: TakeCallback):
+    await callback.message.edit_text("Тейк отправлен в канал! ✅")
+    await sending_take(callback_data.take_id)
 
-    what_time = data.get("send_time")
+@router.callback_query(TakeCallback.filter(F.action == "delete"))
+async def process_delete(callback: types.CallbackQuery, callback_data: TakeCallback):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM takes WHERE id = ?", (callback_data.take_id,))
+        await db.commit()
+    await callback.message.edit_text("Тейк отклонен❌")
 
-    try:
-        await bot.delete_message(chat_id=chatid, message_id=message.message_id)
-        await data.get("msg_to_edit").edit_text(text=f"Тейк отправится в {what_time}")
-    except Exception as e:
-        await message.answer("Ошибка, сообщение возможно удалено.")
-    # Сделать, чтобы пользователь отправлял время только в формате\
-    # 15.02.2026 12:10 (при этом день не обязателен, а время - да)
-    # А также, чтобы время было больше текущего
-    
-    current_time = str(datetime.datetime.now())
-    try:
-        seconds = await how_much_time(current_time=current_time[11:19], when_send=what_time)
-        await asyncio.sleep(seconds)
-        
-        await data.get("msg_to_edit").edit_text(text=f"Тейк отправлен!✅")
-        await sending_take(state=state)
-    except Exception as e:
-        await message.answer("Произошла ошибка при редактировании. Возможно, указан неверный формат времени.")
-
-# Отклонить тейк
-@dp.callback_query(F.data == "del_or_not_take")
-async def del_or_not_take(callback: types.CallbackQuery):
-    await callback.message.answer("Тейк отклонен❌")
-    await callback.message.delete()
-
-
-# Новый хэндлер для обработки кнопки "Назад"
-@dp.callback_query(F.data == "go_back")
-async def process_back(callback_query: types.CallbackQuery):
-    # Редактируем сообщение, возвращая исходный текст и клавиатуру
-    await callback_query.message.edit_text(
-        text="Отправлять тейк?", 
-        reply_markup=get_send_or_not_keyboard()
+@router.callback_query(TakeCallback.filter(F.action == "edit"))
+async def process_edit(callback: types.CallbackQuery, callback_data: TakeCallback):
+    await callback.message.edit_text(
+        "Выберите новый(е) хештег(и)",
+        reply_markup=new_hashtag_keyboard(callback_data.take_id)
     )
-    await callback_query.answer()
 
+@router.callback_query(TakeCallback.filter(F.action == "back"))
+async def process_back(callback: types.CallbackQuery, callback_data: TakeCallback):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute("SELECT finish_text, media_type, file_id FROM takes WHERE id = ?", (callback_data.take_id,)) as cursor:
+            row = await cursor.fetchone()
+        if row:
+            text, media_type, file_id = row
+            await callback.message.edit_text(
+            text="Отправлять тейк?",
+            reply_markup=get_send_or_not_keyboard(take_id=callback_data.take_id)
+            )
+            await db.execute("UPDATE takes SET status = 'sent' WHERE id = ?", (callback_data.take_id,))
+            await db.commit()
+        else:
+            await callback.answer("Ошибка: тейк не найден в базе.") 
 
+# ===============================================
 
-async def hashtag_or_not(message: str) -> bool:
-    if message[0] != "#":
-        return False
-    for i in len(message):
-        if not(message[i] == " " and i != len(message)
-           and message[i+1] == "#"):
-            return False
-    return True
-
-
-
-
-
-@dp.message(F.text)
-async def echo_messages(message: types.Message, state: FSMContext):
-    adm_state = get_admin_state(bot, dp)
-
-    mess = message
-    hshtg = find_words(mess.text)
-    base_text=f'{mess.text}'
-    formatted_text = f'{base_text}\n\n#тейк {hshtg} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
-
-    sent_message = await bot.send_message(chat_id=chatid, text=formatted_text)
-    await bot.send_message(chat_id=chatid, text="Отправлять тейк?",
-                           reply_markup=get_send_or_not_keyboard())
-    
-    await adm_state.update_data(
-        main_msg_id=sent_message.message_id,
-        original_text=base_text,
-        finish_text=formatted_text,
-        media_type=None
+@dp.callback_query(TakeCallback.filter(F.action == "confirm"))
+async def process_confirm_step(callback: types.CallbackQuery, callback_data: TakeCallback):
+    await callback.message.edit_text(
+        "Когда отправить тейк?", 
+        reply_markup=get_confirm_keyboard(callback_data.take_id)
     )
-    
 
-# ДОБАВИТЬ ОБРАБОТЧИК ДЛЯ ВСЕХ ОСТАВШИХСЯ СООБЩЕНИЙ
-@dp.message()
+# ===============================================
+
+@router.message(F.text, F.chat.type=="private")
+async def echo_messages(message: types.Message):
+    hshtg = find_words(message.text)
+    formatted = f'{message.text}\n\n#тейк {hshtg} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+    sent = await bot.send_message(chat_id=chatid, text=formatted)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "INSERT INTO takes (user_id, main_msg_id, original_text, finish_text, media_type) VALUES (?, ?, ?, ?, ?)",
+            (message.from_user.id, sent.message_id, message.text, formatted, "text")
+        )
+        t_id = cursor.lastrowid
+        await db.commit()
+    await bot.send_message(chat_id=chatid, text=f"Тейк #{t_id}. Отправить?", reply_markup=get_send_or_not_keyboard(t_id))
+
+@router.message()
 async def other_msgs(message: types.Message):
-    await message.reply(text=f"Мы принимаем только текст/фото/видео")
-
+    await message.reply("Мы принимаем только текст/фото/видео")
 
 async def main():
+    await init_db()
+    dp.include_router(router)
+    scheduler.start()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    # Запуск бота
     asyncio.run(main())
