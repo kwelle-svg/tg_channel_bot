@@ -57,7 +57,7 @@ def get_admin_state(bot: Bot, dp: Dispatcher):
 async def cmd_start(message: types.Message):
     await message.reply("Напишите пожалуйста ваш тейк (НЕ НУЖНО добавлять оформление). Если обнаружите ошибку - напишите cюда (ссылку добав)\n\nДля создания был использован бот (будущий бот)")
 
-manecen = '#тейк #другое | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+manecen = '#тейк #другое | <a href="t.me/HateHoyoCfBot">бот для тейков</a>'
 
 
 
@@ -137,7 +137,7 @@ async def reset_hashtags(callback: types.CallbackQuery, callback_data: TakeCallb
             row = await cursor.fetchone()
             if row:
                 main_msg_id, orig_text, media_type = row
-                reset_text = f'{orig_text}\n\n#тейк | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+                reset_text = f'{orig_text}\n\n#тейк | <a href="t.me/HateHoyoCfBot">бот для тейков</a>'
                 await db.execute("UPDATE takes SET finish_text = ? WHERE id = ?", (reset_text, callback_data.take_id))
                 await db.commit()
                 
@@ -178,7 +178,7 @@ async def proccess_hashtag(message: types.Message, state: FSMContext):
     hashtags = data.get("new_hashtag")
 
 
-    updated_text = f'{original_text}\n\n#тейк {hashtags} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+    updated_text = f'{original_text}\n\n#тейк {hashtags} | <a href="t.me/HateHoyoCfBot">бот для тейков</a>'
     
     try:
         if media_type == "photo" or media_type == "video" or media_type == "album":
@@ -213,7 +213,7 @@ async def proccess_hashtag(message: types.Message, state: FSMContext):
 @router.message(F.media_group_id)
 async def handle_albums(message: Message, album: List[Message]):
     caption = album[0].caption or ""
-    formatted = f'{caption}\n\n#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+    formatted = f'{caption}\n\n#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/HateHoyoCfBot">бот для тейков</a>'
     
     media_files = []
     builder = MediaGroupBuilder(caption=formatted)
@@ -239,7 +239,7 @@ async def handle_albums(message: Message, album: List[Message]):
 async def handle_photo(message: Message):
     f_id = message.photo[-1].file_id
     caption = message.caption or ""
-    formatted = f'{caption}\n\n#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+    formatted = f'{caption}\n\n#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/HateHoyoCfBot">бот для тейков</a>'
     
     sent = await bot.send_photo(chat_id=chatid, photo=f_id, caption=formatted)
     async with aiosqlite.connect(DB_NAME) as db:
@@ -253,7 +253,7 @@ async def handle_photo(message: Message):
 async def echo_video_messages(message: Message):
     file_id = message.video.file_id
     caption = message.caption or ""
-    formatted_caption = f'{caption + "\n\n" if caption else ""}#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+    formatted_caption = f'{caption + "\n\n" if caption else ""}#тейк {find_words(caption) if caption else "#другое"} | <a href="t.me/HateHoyoCfBot">бот для тейков</a>'
     
     sent = await bot.send_video(chat_id=chatid, video=file_id, caption=formatted_caption)
     
@@ -444,7 +444,7 @@ async def process_confirm_step(callback: types.CallbackQuery, callback_data: Tak
 @router.message(F.text, F.chat.type=="private")
 async def echo_messages(message: types.Message):
     hshtg = find_words(message.text)
-    formatted = f'{message.text}\n\n#тейк {hshtg} | <a href="t.me/@HateHoyoCfBot">бот для тейков</a>'
+    formatted = f'{message.text}\n\n#тейк {hshtg} | <a href="t.me/HateHoyoCfBot">бот для тейков</a>'
     sent = await bot.send_message(chat_id=chatid, text=formatted)
 
     async with aiosqlite.connect(DB_NAME) as db:
@@ -456,7 +456,7 @@ async def echo_messages(message: types.Message):
         await db.commit()
     await bot.send_message(chat_id=chatid, text=f"Тейк #{t_id}. Отправить?", reply_markup=get_send_or_not_keyboard(t_id))
 
-@router.message()
+@router.message(F.chat.type=="private")
 async def other_msgs(message: types.Message):
     await message.reply("Мы принимаем только текст/фото/видео")
 
